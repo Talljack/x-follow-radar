@@ -1,0 +1,9 @@
+node_modules/
+dist/
+test/shots/
+test/real-review/
+.env
+.env.*
+.DS_Store
+*.zip
+*.log

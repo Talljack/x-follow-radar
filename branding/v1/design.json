@@ -1,0 +1,12 @@
+{
+  "product": "X 关注雷达",
+  "identity": "独立产品品牌，不关联个人IP、角色或个人标识",
+  "concept": "雷达信号与未读圆点",
+  "palette": {"cobalt": "#245BFF", "mint": "#89FFCF", "porcelain": "#F5F6F1", "ink": "#14201F"},
+  "headline": "只追你关心的",
+  "subline": "新帖集中看，已读不重复。",
+  "features": ["快捷关注", "集中阅读", "已读去重"],
+  "icon": {"master": "icon-master.png", "description": "钴蓝底、白色雷达弧线、薄荷色未读信号点"},
+  "splash": {"master": "splash-landscape.png", "description": "暖白底、深色文案、雷达整理更新卡片"},
+  "usage": "图标用于插件入口；开屏图用于首次使用欢迎页或产品宣传，不作为每次打开的强制等待画面。"
+}
