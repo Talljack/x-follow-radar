@@ -7,3 +7,4 @@ test/real-review/
 .DS_Store
 *.zip
 *.log
+tools/icons.py

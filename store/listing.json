@@ -1,0 +1,27 @@
+{
+  "name": "X 关注雷达",
+  "language": "zh-CN",
+  "category": "Productivity",
+  "short_description": "集中阅读你关心的 X 博主更新，展开长帖，记录已读，看过不重复。",
+  "description": "只追你关心的，新帖集中看，已读不重复。\n\nX 关注雷达把你选择的博主和 X 列表汇总为一个阅读面板，让你打开 X 时先看主动关注的信息。\n\n主要功能\n• 在推文、博主主页、账号悬停卡片或右键菜单中快捷添加博主。\n• 添加后取回该博主最近的帖子，并按时间集中展示未读更新。\n• 展开长正文与引用，查看配图；点击卡片打开原帖。\n• 根据前台可见性、停留时间及操作记录已读，关闭重开后隐藏已读帖子。\n• 在“全部”里回看记录，在“博主”里管理名单与检查间隔。\n• 默认过滤回复与转帖，可选择包含转帖，也可添加已有 X 列表。\n\n隐私与使用条件\n无需另行申请 X API，不需要开发者服务器。名单、缓存和阅读记录保存在本机浏览器，不上传到开发者服务器。需要你已登录 X 网页版；检查时扩展会在后台标签页读取 X 的搜索或列表页面。\n\n阅读判定是“在前台看见并停留过”，不保证已读完全文。搜索覆盖和 X 页面改版可能影响抓取，不能保证补齐所有历史帖子。\n\n这是独立产品，与 X Corp. 无关。商店功能截图使用明确标记的演示数据。",
+  "homepage_url": "https://github.com/Talljack/x-follow-radar",
+  "support_url": "https://github.com/Talljack/x-follow-radar/issues",
+  "privacy_policy_url": "https://github.com/Talljack/x-follow-radar/blob/main/PRIVACY.md",
+  "single_purpose": "在 X 网页版集中阅读用户主动选择的博主与列表更新，并通过本地已读状态避免重复展示。",
+  "permissions": {
+    "storage": "在本机保存用户选择的博主、列表、设置、帖子缓存、已读状态和去重编号。",
+    "alarms": "按用户设置的间隔调度更新检查；默认 30 分钟。",
+    "contextMenus": "让用户通过博主或帖子链接的右键菜单添加到本地雷达名单。",
+    "scripting": "在已经打开的 X 标签页中注入随安装包提供的界面脚本，使安装或更新后可以显示扩展控件。",
+    "host_permissions": "仅访问 x.com 和 twitter.com，以显示快捷添加按钮、读取选定账号或列表的帖子、判定前台阅读状态。后台检查通过用户现有 X 网页登录会话进行。"
+  },
+  "remote_code": false,
+  "data_practices": {
+    "processed_locally": ["用户主动添加的 X 账号和列表", "选定帖子的内容与媒体链接", "X 页面上的阅读与操作状态"],
+    "sent_to_developer": false,
+    "third_party_requests": "所选账号用于 X 搜索请求；媒体与头像由 X/CDN 加载。",
+    "analytics": false,
+    "sale_of_data": false
+  },
+  "reviewer_instructions": "请使用已登录的 X 测试账号访问 x.com。添加一个有近期帖子的公开博主，例如 OpenAI。点击右下角雷达进入未读列表；可展开长正文、点勾标为已读，关闭重开验证过滤。博主标签用于名单和设置。首次取回取决于 X 页面加载与搜索结果。扩展本身没有独立账号或付费功能。"
+}
