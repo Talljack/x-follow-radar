@@ -1,6 +1,6 @@
 {
   "name": "x-follow-radar",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "description": "Read updates from selected X accounts without resurfacing posts you have already seen.",
   "scripts": {

@@ -122,7 +122,8 @@ npm test
 - `hook.js`：只在后台标签页里生效，抄一份 X 自己下载的时间线数据
 - `shared.js`：账号名解析、推文数据解析
 - `tools/package.mjs`：只打包运行必需文件，生成商店 ZIP
-- `branding/v1/`：正式图标与欢迎宣传图
+- `branding/v2/`：加入 X 标记的正式图标
+- `branding/v1/`：原始品牌资产与欢迎宣传图
 - `PRIVACY.md`：隐私说明
 
 读推文卡片的选择器参考了 [yetone/rewind-for-x](https://github.com/yetone/rewind-for-x)（MIT）。
