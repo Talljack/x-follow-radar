@@ -1,10 +1,11 @@
 {
   "name": "x-follow-radar",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "description": "Read updates from selected X accounts without resurfacing posts you have already seen.",
   "scripts": {
-    "test": "node test/e2e.mjs",
+    "test": "node test/scan-recovery.mjs && node test/e2e.mjs",
+    "test:recovery": "node test/scan-recovery.mjs && node test/e2e.mjs --recovery",
     "check": "node --check background.js && node --check content.js && node --check shared.js && node --check hook.js",
     "package": "node tools/package.mjs",
     "store:screenshots": "node tools/store-screenshots.mjs"

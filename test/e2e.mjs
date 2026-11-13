@@ -30,7 +30,7 @@ const shot = (name) => path.join(EXT, 'test', 'shots', name);
 
 // ------------------------------------------------------------ fake x.com
 
-const world = { feed: [], home: [], domOnly: false, loggedOut: false, strictBroken: false, searches: 0, queries: [] };
+const world = { feed: [], home: [], domOnly: false, loggedOut: false, strictBroken: false, apiErrors: 0, searches: 0, queries: [] };
 
 const pad = (n) => String(n).padStart(2, '0');
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -98,6 +98,10 @@ async function serve(route) {
   const html = (body) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: shell(body) });
 
   if (url.pathname.includes('/graphql/')) {
+    if (world.apiErrors > 0) {
+      world.apiErrors--;
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ errors: [{ message: 'Temporary X error' }] }) });
+    }
     const vars = JSON.parse(url.searchParams.get('variables') || '{}');
     const entries = wanted(vars.rawQuery).map(entry);
     return route.fulfill({
@@ -213,7 +217,7 @@ const expire = async () => {
   await idle();
   return (await worker()).evaluate(async () => {
     const d = await chrome.storage.local.get('xfr_meta');
-    const meta = Object.assign({}, d.xfr_meta, { lastCheck: 1 });
+    const meta = Object.assign({}, d.xfr_meta, { lastCheck: 1, lastAttempt: 1 });
     await chrome.storage.local.set({ xfr_meta: meta });
     await chrome.alarms.clear('xfr-soon');
   });
@@ -225,7 +229,7 @@ const states = async () => {
 const finished = () =>
   until(async () => {
     const m = (await store()).xfr_meta;
-    return m && m.checking === false && m.lastCheck > 1;
+    return m && m.checking === false && Math.max(m.lastAttempt || 0, m.lastCheck || 0) > 1;
   }, 60000);
 // Entering X: load a page and let the check it triggers run to the end.
 async function enter(page, url = 'https://x.com/home') {
@@ -269,6 +273,7 @@ try {
   const statusText = async () => (await page.locator('#xfr-host .status').innerText()).replace(/\s+/g, ' ');
   const closePanel = () => page.locator('#xfr-host .panel .head button', { hasText: '✕' }).click();
 
+  if (!process.argv.includes('--recovery')) {
   console.log('\n1. 从博主主页快速添加');
   await page.goto('https://x.com/alice');
   const add = page.locator('button[data-xfr="btn"]');
@@ -319,6 +324,8 @@ try {
   await page.screenshot({ path: shot('toast.png') }).catch(() => {});
   let st = await states();
   ok(st['100'] === 'read', '已经看过首轮的博主，后来才抓到的旧推文不弹，只进历史', st);
+  await until(async () => { const current = await states(); return current['101'] === 'shown' && current['201'] === 'shown'; }, 5000);
+  st = await states();
   ok(st['101'] === 'shown' && st['201'] === 'shown', '新推文弹过后记为“已弹”', st);
   ok(!st['900'] && !st['901'], '没订阅的人和广告不收', st);
   ok(!st['300'] && !st['301'], '默认不收转推', st);
@@ -350,7 +357,7 @@ try {
   await page.locator('#xfr-host .panel .item button[title="标记为已读"]').first().click();
   ok(await until(async () => (await cards.count()) === 2, 5000), '点 ✓ 的那条马上消失');
   const openedId = await cards.first().getAttribute('data-id');
-  const [popup] = await Promise.all([ctx.waitForEvent('page'), cards.first().click()]);
+  const [popup] = await Promise.all([page.waitForEvent('popup'), cards.first().click()]);
   ok(/\/status\/\d+/.test(popup.url()), '点卡片在新标签页打开推文', popup.url());
   await popup.close();
   ok(
@@ -469,7 +476,7 @@ try {
   const h1 = await long.locator('.text').evaluate((el) => el.clientHeight);
   await long.locator('.more').click();
   const h2 = await long.locator('.text').evaluate((el) => el.clientHeight);
-  ok(h2 > h1 && (await long.locator('.more').count()) === 0 && ctx.pages().length === 1, '点“展开”就在面板里看全文，不会跳走', { h1, h2 });
+  ok(h2 > h1 && (await long.locator('.more').count()) === 0 && ctx.pages().filter(p => !p.url().includes('#xfr-scan')).length === 1, '点“展开”就在面板里看全文，不会跳走', { h1, h2 });
   const pic = cards.filter({ hasText: 'dave old 2' });
   ok((await pic.locator('.m img').count()) === 1 && (await pic.locator('.quote').innerText()).includes('the post being quoted'), '配图和引用的推文直接显示');
   const four = cards.filter({ hasText: 'dave old 3' });
@@ -850,6 +857,72 @@ try {
     ok(buttonBox.x + buttonBox.width <= width - 16, `${width}px 按钮不溢出屏幕`);
     await page.screenshot({ path: shot(`detail-entry-${width}.png`) });
   }
+  } else {
+    await page.goto('https://x.com/home');
+    await page.locator('#xfr-host .fab').waitFor();
+  }
+  console.log('\n28. X 临时加载失败：自动重试并保留同步边界');
+  if (await page.locator('#xfr-host .panel').isVisible()) await closePanel();
+  await idle();
+  world.feed = [{ id: '999001', handle: 'recovery', text: 'latest after retry', ts: Date.now() + 1000 }];
+  world.apiErrors = 1;
+  const beginRecovery = () => worker().then(w => w.evaluate(async () => {
+    const d = await chrome.storage.local.get('xfr_meta');
+    await chrome.storage.local.set({ xfr_subs: [{ handle: 'recovery', addedAt: 1, primed: true }],
+      xfr_meta: { ...d.xfr_meta, checking: false } });
+    return locked(async () => startCheck(await load(), { force: true }));
+  }));
+  let beforeRecovery = world.searches;
+  await beginRecovery();
+  ok(await idle(), '临时失败后的检查完成');
+  let recoveryState = await store();
+  ok(world.searches === beforeRecovery + 2, '首个 API 错误自动重开一次后台页');
+  ok(['new', 'shown'].includes(recoveryState.xfr_tweets['999001']?.state) && !recoveryState.xfr_meta.lastError, '重试取回新帖，错误状态清除', {tweet:recoveryState.xfr_tweets['999001'],meta:recoveryState.xfr_meta});
+  await page.locator('#xfr-host .fab').click();
+  await idle();
+  await (await worker()).evaluate(() => handlers.markAllRead());
+  recoveryState = await store();
+  const lastSuccess = recoveryState.xfr_meta.lastCheck;
+  const ledgerBeforeFailure = JSON.stringify(recoveryState.xfr_ledger);
+  world.apiErrors = 2;
+  beforeRecovery = world.searches;
+  await beginRecovery();
+  ok(await idle(), '连续失败后的检查结束');
+  recoveryState = await store();
+  ok(world.searches === beforeRecovery + 2, '连续失败最多尝试两次，不循环');
+  ok(recoveryState.xfr_meta.lastError === 'nodata' && recoveryState.xfr_meta.lastCheck === lastSuccess, '失败不伪装成功，不推进成功同步时间');
+  ok(JSON.stringify(recoveryState.xfr_ledger) === ledgerBeforeFailure && !!recoveryState.xfr_tweets['999001'], '失败保留缓存与去重记录');
+  await until(async () => (await page.locator('#xfr-host .status').innerText()).includes('更新失败，当前为缓存'), 5000);
+  const failedStatus = await page.locator('#xfr-host .status').innerText();
+  ok(failedStatus.includes('更新失败，当前为缓存') && !failedStatus.includes('没有新推文'), '界面明确标出缓存而非没有更新', failedStatus);
+
+  console.log('\n29. 每次打开都检查所有博主，未读合并按时间排序');
+  await closePanel();
+  const now = Date.now();
+  world.feed = [
+    { id: '999101', handle: 'first', text: 'first newest', ts: now - 10000 },
+    { id: '999102', handle: 'second', text: 'second middle', ts: now - 20000 },
+    { id: '999103', handle: 'first', text: 'already seen', ts: now - 30000 },
+  ];
+  await (await worker()).evaluate(async (now) => {
+    const d = await chrome.storage.local.get(null);
+    await chrome.storage.local.set({ xfr_subs: ['first','second'].map(handle => ({ handle, addedAt: now, primed: true })),
+      xfr_ledger: [...d.xfr_ledger, '999103'], xfr_meta: { ...d.xfr_meta, lastCheck: now, lastAttempt: now, lastError: '' } });
+  }, now);
+  await sleep(300);
+  beforeRecovery = world.searches;
+  await page.locator('#xfr-host .fab').click();
+  await until(() => world.searches >= beforeRecovery + 2);
+  await idle();
+  await until(async () => (await page.locator('#xfr-host .body .item').count()) === 2, 5000);
+  const openingCards = await page.locator('#xfr-host .body .item').evaluateAll(es => es.map(e => e.dataset.id));
+  ok(JSON.stringify(openingCards) === JSON.stringify(['999101','999102']), '两位博主的未读合并排序，之前看过的不再出现', {openingCards, tweets: (await store()).xfr_tweets});
+  const firstOpenSearches = world.searches;
+  await closePanel();
+  await page.locator('#xfr-host .fab').click();
+  await until(() => world.searches >= firstOpenSearches + 2);
+  await idle();
+  ok(world.searches === firstOpenSearches + 2, '一分钟内关闭重开也逐个检查两位博主，不受30分钟间隔限制');
 } catch (e) {
   failed++;
   console.log('  FAIL  ' + (e && e.stack ? e.stack : e));

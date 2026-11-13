@@ -103,16 +103,21 @@ function ingest(st, items, job) {
   let fresh = 0;
   let unread = 0;
 
-  // On a first look, the newest few posts go to "unread" although they were
-  // posted before the account was added. That is what the user added it for.
+  // First looks and panel openings recover recent unseen posts per author,
+  // including posts published before subscription or missed in an earlier scan.
   const recent = new Set();
-  if (job.prime) {
+  if (job.prime || job.catchUp) {
     const owner = list ? '' : String((job.handles || [])[0] || '').toLowerCase();
+    const counts = new Map();
     items
-      .filter((it) => it && it.id && it.handle && !(it.via || []).length && (list || it.handle.toLowerCase() === owner))
+      .filter((it) => it && it.id && it.handle && !(it.via || []).length && (list || job.catchUp || it.handle.toLowerCase() === owner))
       .sort(newestFirst)
-      .slice(0, FIRST_LOOK)
-      .forEach((it) => recent.add(it.id));
+      .forEach((it) => {
+        const key = list ? 'list' : it.handle.toLowerCase();
+        const n = counts.get(key) || 0;
+        if (n < FIRST_LOOK) recent.add(it.id);
+        counts.set(key, n + 1);
+      });
   }
 
   for (const it of items) {
@@ -188,18 +193,20 @@ const hasWaiting = (st) => st.subs.some((s) => !s.primed) || waitingList(st);
 
 // An account that has not had its first look gets a search of its own, so its
 // latest posts are not crowded out by busier accounts. The rest are searched
-// together, BATCH at a time. `primeOnly` leaves those out.
-function buildQueue(st, primeOnly) {
+// together, BATCH at a time. Panel catch-up checks each author separately.
+// `primeOnly` leaves already-primed authors out.
+function buildQueue(st, primeOnly, catchUp = false) {
   const jobs = [];
   const url = (handles) => searchUrl(handles, st.settings.retweets, st.settings.plainQuery);
   const waiting = st.subs.filter((s) => !s.primed).sort((a, b) => (a.primeFails || 0) - (b.primeFails || 0));
-  for (const s of waiting.slice(0, SOLO)) {
+  for (const s of waiting.slice(0, catchUp ? waiting.length : SOLO)) {
     jobs.push({ kind: 'search', prime: true, handles: [s.handle], url: url([s.handle]) });
   }
   if (!primeOnly) {
     const known = st.subs.filter((s) => s.primed).map((s) => s.handle);
-    for (let i = 0; i < known.length; i += BATCH) {
-      const slice = known.slice(i, i + BATCH);
+    const size = catchUp ? 1 : BATCH;
+    for (let i = 0; i < known.length; i += size) {
+      const slice = known.slice(i, i + size);
       jobs.push({ kind: 'search', handles: slice, url: url(slice) });
     }
   }
@@ -211,12 +218,29 @@ function buildQueue(st, primeOnly) {
 
 async function startCheck(st, opts) {
   const o = opts || {};
-  const queue = buildQueue(st, !!o.primeOnly);
+  const queue = buildQueue(st, !!o.primeOnly, !!o.catchUp);
+  if (o.catchUp) for (const job of queue) job.catchUp = true;
   if (!queue.length) return { started: false, reason: 'empty' };
 
   const running = await getScan();
-  if (running && Date.now() - running.stepAt < STEP_LIMIT + 35000) return { started: false, reason: 'busy' };
-  if (!o.force && Date.now() - (st.meta.lastCheck || 0) < st.settings.intervalMin * 60000 - 5000) {
+  if (running && Date.now() - running.stepAt < STEP_LIMIT + 35000) {
+    // Opening while a scheduled check runs must still catch up every author.
+    if (o.catchUp) {
+      if (running.cur) running.cur.catchUp = true;
+      running.queue = queue.filter((job) => job.url !== (running.cur && running.cur.url));
+      await setScan(running);
+    } else if (o.primeOnly) {
+      const pending = new Set([running.cur && running.cur.url, ...running.queue.map(job => job.url)]);
+      for (const job of queue) if (!pending.has(job.url)) {
+        running.queue.push(job);
+        pending.add(job.url);
+      }
+      await setScan(running);
+      return { started: false, reason: 'queued' };
+    }
+    return { started: false, reason: 'busy' };
+  }
+  if (!o.force && Date.now() - Math.max(st.meta.lastAttempt || 0, st.meta.lastCheck || 0) < st.settings.intervalMin * 60000 - 5000) {
     return { started: false, reason: 'fresh' };
   }
 
@@ -252,7 +276,7 @@ async function startCheck(st, opts) {
 async function nextStep(st, scan) {
   const job = scan.queue.shift();
   if (!job) return finish(st, scan);
-  scan.cur = { kind: job.kind, handles: job.handles, prime: !!job.prime, plain: !!job.plain };
+  scan.cur = { kind: job.kind, handles: job.handles, prime: !!job.prime, plain: !!job.plain, catchUp: !!job.catchUp, url: job.url, retry: job.retry || 0 };
   scan.stepAt = Date.now();
   await setScan(scan);
 
@@ -296,7 +320,11 @@ function settleJob(st, scan, job, error) {
 
 async function finish(st, scan) {
   st.meta.checking = false;
-  if (scan.full) st.meta.lastCheck = Date.now();
+  if (scan.full) {
+    st.meta.lastAttempt = Date.now();
+    // Failed/partial rounds must not move the successful catch-up boundary.
+    if (!scan.errors.length) st.meta.lastCheck = st.meta.lastAttempt;
+  }
   st.meta.lastError = scan.errors[0] || '';
   st.meta.lastAdded = scan.added || 0;
   st.meta.lastFresh = scan.fresh || 0;
@@ -315,10 +343,24 @@ async function finish(st, scan) {
   }
 }
 
+// A temporary X error or slow background page should not require a manual
+// check. Reopen the same job once; do not loop or retry authentication walls.
+async function retryStep(st, scan, error) {
+  if (!['nodata', 'timeout'].includes(error) || !scan.cur || scan.cur.retry || !scan.cur.url) return false;
+  const tabId = scan.tabId;
+  scan.tabId = null;
+  scan.queue.unshift({ ...scan.cur, retry: 1 });
+  await setScan(scan);
+  if (tabId) await chrome.tabs.remove(tabId).catch(() => {});
+  await nextStep(st, scan);
+  return true;
+}
+
 async function onScanDone(st, msg, sender) {
   const scan = await getScan();
   const tabId = sender.tab && sender.tab.id;
   if (!scan || !tabId || scan.tabId !== tabId) return { ok: false };
+  if (await retryStep(st, scan, msg.error)) return { ok: true };
 
   scan.tabId = null;
   const job = scan.cur || { kind: 'search', handles: [] };
@@ -366,6 +408,7 @@ async function onScanDone(st, msg, sender) {
 
 // The page for the current step is stuck or gone: note it and move on.
 async function abandon(st, scan, error) {
+  if (await retryStep(st, scan, error)) return;
   const tabId = scan.tabId;
   scan.tabId = null;
   scan.errors.push(error);
@@ -539,7 +582,7 @@ const handlers = {
     return locked(async () => {
       const st = await load();
       const windowId = (sender.tab && sender.tab.windowId) || null;
-      return startCheck(st, { force: !!msg.force, windowId });
+      return startCheck(st, { force: !!msg.force, catchUp: !!msg.catchUp, windowId });
     });
   },
   async markShown(msg) {

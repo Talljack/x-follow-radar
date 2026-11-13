@@ -127,6 +127,14 @@
     return out;
   }
 
+  // Empty results are success only when X actually returned a timeline.
+  // HTTP 200 can also carry API errors or an unfamiliar response shape.
+  function hasTimeline(node, depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 40) return false;
+    if (Array.isArray(node.instructions)) return true;
+    return Object.values(node).some((value) => hasTimeline(value, depth + 1));
+  }
+
   // ------------------------------------------------------- a rendered post
   // Selectors follow yetone/rewind-for-x (MIT).
 
@@ -198,5 +206,5 @@
     };
   }
 
-  globalThis.XFR = { TWEET, validHandle, handleFrom, fromGraphQL, fromArticle, idOfArticle };
+  globalThis.XFR = { TWEET, validHandle, handleFrom, fromGraphQL, hasTimeline, fromArticle, idOfArticle };
 })();

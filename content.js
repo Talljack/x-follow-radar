@@ -76,9 +76,12 @@
     const absorb = () => {
       while (RAW.length) {
         const raw = RAW.shift();
-        responses++;
         try {
-          for (const it of X.fromGraphQL(JSON.parse(raw))) mergeItem(items, it);
+          const json = JSON.parse(raw);
+          const parsed = X.fromGraphQL(json);
+          if (!parsed.length && !X.hasTimeline(json)) continue;
+          responses++;
+          for (const it of parsed) mergeItem(items, it);
         } catch {}
       }
     };
@@ -105,7 +108,7 @@
     // first look at an account takes the first page as it is.
     for (let i = 0; hello.deep !== false && i < 3 && Date.now() < deadline; i++) {
       const times = [...items.values()].map((t) => t.ts || 0).filter(Boolean);
-      if (times.length && Math.min(...times) < since) break;
+      if (!times.length || Math.min(...times) < since) break;
       const seen = responses;
       window.scrollTo(0, document.documentElement.scrollHeight);
       if (!(await waitFor(() => responses > seen, 4000))) break;
@@ -260,7 +263,7 @@
     login: '你没有登录 X，请先登录再检查',
     timeout: '后台页面加载超时',
     closed: '后台页面被关闭',
-    nodata: '没读到数据，X 的页面结构可能变了',
+    nodata: '暂时未能读取 X 数据，请重试',
   };
 
   const byTsDesc = (a, b) => (b.ts || 0) - (a.ts || 0);
@@ -336,13 +339,14 @@
 
   function renderStatus() {
     const m = S.meta || {};
-    const parts = [m.lastCheck ? `上次检查 ${ago(m.lastCheck)}` : '还没检查过'];
+    const parts = [m.lastCheck ? `上次成功更新 ${ago(m.lastCheck)}` : '尚未成功更新'];
     const backlog = (m.lastUnread || 0) - (m.lastFresh || 0);
+    const err = !checking && m.lastError;
     if (checking) parts.push('正在检查…');
+    else if (err) parts.push('更新失败，当前为缓存');
     else if (m.lastFresh) parts.push(`发现 ${m.lastFresh} 条新推文`);
     else if (backlog > 0) parts.push(`取回 ${backlog} 条最近的推文`);
     else if (m.lastCheck) parts.push('没有新推文');
-    const err = !checking && m.lastError;
     status.className = err ? 'status err' : 'status';
     status.textContent = err ? `${parts.join(' · ')} · ${ERRORS[err] || err}` : parts.join(' · ');
   }
@@ -633,6 +637,7 @@
 
   function setOpen(v) {
     if (gone()) return;
+    const opening = v && !open;
     open = v;
     panel.style.display = v ? 'flex' : 'none';
     if (v) {
@@ -645,6 +650,7 @@
       body.scrollTop = 0;
       const fresh = Object.values(S.tweets).filter((t) => t.state === 'new');
       if (fresh.length) send({ type: 'markShown', ids: fresh.map((t) => t.id) });
+      if (opening && (S.subs.length || S.settings.listUrl)) requestCheck(true, true);
     } else {
       stopWatching();
       flushRead();
@@ -1106,15 +1112,15 @@
     maybePopup();
   }
 
-  async function requestCheck(force) {
-    const r = await send({ type: 'check', force });
+  async function requestCheck(force, opening = false) {
+    const r = await send({ type: 'check', force, catchUp: opening });
     if (r && r.started) {
       checking = true;
       updateFab();
       render();
-    } else if (force && r && r.reason === 'empty') {
+    } else if (!opening && force && r && r.reason === 'empty') {
       showToast('名单还是空的，先添加一位博主', null);
-    } else if (force && r && r.reason === 'busy') {
+    } else if (!opening && force && r && r.reason === 'busy') {
       showToast('正在检查中，稍等几秒', null);
     }
   }
@@ -1124,7 +1130,8 @@
     if (document.visibilityState !== 'visible' || checking) return;
     if (!S.subs.length && !S.settings.listUrl) return;
     const interval = (S.settings.intervalMin || 30) * 60000;
-    if (Date.now() - ((S.meta || {}).lastCheck || 0) < interval - 5000) return;
+    const m = S.meta || {};
+    if (Date.now() - Math.max(m.lastAttempt || 0, m.lastCheck || 0) < interval - 5000) return;
     requestCheck(false);
   }
 
