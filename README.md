@@ -8,9 +8,11 @@
 
 ## 安装
 
-推荐通过 **Chrome Web Store** 安装，后续版本由 Chrome 自动更新，无需开启开发者模式。
+[**从 Chrome Web Store 安装 X 关注雷达 →**](https://chromewebstore.google.com/detail/kmjpghphfgijcnonamcggfcgehddmefm)
 
-**当前状态：v0.2.5 已提交商店审核，尚未正式上架。** 审核通过后，此处将提供商店直达安装链接。
+点击“添加至 Chrome”即可安装，后续版本由 Chrome 自动更新，无需开启开发者模式。
+
+商店已正式上架。修复版 **v0.2.6** 包含打开即检查、多博主未读排序和失败重试；商店更新需等待 Google 审核，提前体验可下载 [GitHub 最新版本](https://github.com/Talljack/x-follow-radar/releases/latest)。
 
 安装后打开 [X 网页版](https://x.com) 并登录，即可添加博主。需要提前体验或参与开发，可使用下方的[本地安装](#本地安装开发与提前体验)。
 
