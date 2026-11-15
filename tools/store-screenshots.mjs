@@ -10,6 +10,8 @@ const test = fs.readFileSync(path.join(root, 'test/e2e.mjs'), 'utf8');
 const marker = "  console.log('\\n1. 从博主主页快速添加');";
 if (!test.includes(marker)) throw new Error('Offline fixture setup changed');
 const prefix = test.slice(0, test.indexOf(marker)).replace(
+  "  if (!process.argv.includes('--recovery') && !process.argv.includes('--window')) {\n", ''
+).replace(
   "const EXT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');",
   `const EXT = ${JSON.stringify(root)};`
 );

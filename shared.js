@@ -206,5 +206,7 @@
     };
   }
 
-  globalThis.XFR = { TWEET, validHandle, handleFrom, fromGraphQL, hasTimeline, fromArticle, idOfArticle };
+  const windowHours = settings => [24,48,72].includes(Number(settings?.windowHours)) ? Number(settings.windowHours) : 72;
+  const windowMs = settings => windowHours(settings) * 3600000;
+  globalThis.XFR = { windowHours, windowMs, TWEET, validHandle, handleFrom, fromGraphQL, hasTimeline, fromArticle, idOfArticle };
 })();

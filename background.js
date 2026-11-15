@@ -29,6 +29,7 @@ const K = {
 };
 const DEFAULTS = {
   intervalMin: 30,
+  windowHours: 72,
   popup: true,
   retweets: false,
   listUrl: '',
@@ -41,8 +42,7 @@ const MAX_TWEETS = 600;      // history kept
 const MAX_LEDGER = 20000;    // ids that must never be announced again
 const BATCH = 10;            // accounts per search
 const SOLO = 10;             // first looks at newly added accounts, per round
-const FIRST_LOOK = 10;       // posts from before an account was added that go to "unread"
-const STEP_LIMIT = 40000;    // a single page has this long
+const STEP_LIMIT = 130000;    // a single page has this long
 const X_URLS = ['https://x.com/*', 'https://twitter.com/*'];
 
 // Every storage mutation goes through one queue so two calls can't clobber
@@ -72,7 +72,7 @@ async function save(st, keys) {
 }
 
 async function refreshBadge(st) {
-  const n = Object.values(st.tweets).filter((t) => t.state !== 'read').length;
+  const n = Object.values(st.tweets).filter((t) => t.state !== 'read' && t.ts >= Date.now() - X.windowMs(st.settings)).length;
   await chrome.action.setBadgeBackgroundColor({ color: '#1d9bf0' });
   await chrome.action.setBadgeText({ text: n ? (n > 99 ? '99+' : String(n)) : '' });
 }
@@ -87,7 +87,7 @@ function prune(st) {
   if (all.length > MAX_TWEETS) {
     const unread = all.filter((t) => t.state !== 'read').sort(newestFirst);
     const read = all.filter((t) => t.state === 'read').sort(newestFirst);
-    st.tweets = Object.fromEntries(unread.concat(read).slice(0, MAX_TWEETS).map((t) => [t.id, t]));
+    st.tweets = Object.fromEntries(unread.concat(read.slice(0, Math.max(0, MAX_TWEETS - unread.length))).map((t) => [t.id, t]));
   }
   if (st.ledger.length > MAX_LEDGER) st.ledger = st.ledger.slice(-MAX_LEDGER);
 }
@@ -108,20 +108,16 @@ function ingest(st, items, job) {
   const recent = new Set();
   if (job.prime || job.catchUp) {
     const owner = list ? '' : String((job.handles || [])[0] || '').toLowerCase();
-    const counts = new Map();
     items
       .filter((it) => it && it.id && it.handle && !(it.via || []).length && (list || job.catchUp || it.handle.toLowerCase() === owner))
       .sort(newestFirst)
       .forEach((it) => {
-        const key = list ? 'list' : it.handle.toLowerCase();
-        const n = counts.get(key) || 0;
-        if (n < FIRST_LOOK) recent.add(it.id);
-        counts.set(key, n + 1);
+        if (it.ts >= Date.now() - X.windowMs(st.settings)) recent.add(it.id);
       });
   }
 
   for (const it of items) {
-    if (!it || !it.id || !it.handle) continue;
+    if (!it || !it.id || !it.handle || !it.ts || it.ts < Date.now() - X.windowMs(st.settings)) continue;
     if (it.via && it.via.length && !st.settings.retweets) continue;
 
     let base = 0;
@@ -179,10 +175,10 @@ const setScan = async (s) => (s ? chrome.storage.session.set({ [K.SCAN]: s }) : 
 // Posts by these accounts only: no replies, and no reposts of other people's
 // posts unless the user asked for those. `plain` leaves the repost condition
 // out; reposts that come back are dropped when the results are stored.
-function searchUrl(handles, retweets, plain) {
+function searchUrl(handles, retweets, plain, range) {
   const from = handles.map((h) => 'from:' + h).join(' OR ');
   const reposts = retweets ? ' include:nativeretweets' : plain ? '' : ' -filter:nativeretweets';
-  const q = `(${from}) -filter:replies${reposts}`;
+  const q = `(${from}) -filter:replies${reposts}${range ? ` since:${range.since} until:${range.until}` : ''}`;
   return `https://x.com/search?q=${encodeURIComponent(q)}&src=typed_query&f=live#xfr-scan`;
 }
 
@@ -213,7 +209,18 @@ function buildQueue(st, primeOnly, catchUp = false) {
   if (st.settings.listUrl && (!primeOnly || waitingList(st))) {
     jobs.push({ kind: 'list', prime: waitingList(st), handles: [], url: scanUrl(st.settings.listUrl) });
   }
-  return jobs;
+  // Bound native X searches by UTC day: a busy author's later pages must
+  // not hide the older part of the three-day window behind a stalled cursor.
+  return jobs.flatMap(job => {
+    if (job.kind !== 'search' || (!job.prime && !catchUp)) return [job];
+    const lower = Math.max(job.prime ? 0 : st.meta.lastCheck || 0, Date.now() - X.windowMs(st.settings));
+    const day = 86400000, result = [];
+    for (let start = Math.floor(lower / day) * day - day; start <= Date.now(); start += day) {
+      const range = {since:new Date(start).toISOString().slice(0,10),until:new Date(start+day).toISOString().slice(0,10)};
+      result.unshift({...job,range,since:Math.max(start,lower),url:searchUrl(job.handles,st.settings.retweets,st.settings.plainQuery,range)});
+    }
+    return result;
+  });
 }
 
 async function startCheck(st, opts) {
@@ -276,9 +283,13 @@ async function startCheck(st, opts) {
 async function nextStep(st, scan) {
   const job = scan.queue.shift();
   if (!job) return finish(st, scan);
-  scan.cur = { kind: job.kind, handles: job.handles, prime: !!job.prime, plain: !!job.plain, catchUp: !!job.catchUp, url: job.url, retry: job.retry || 0 };
+  scan.cur = { kind: job.kind, handles: job.handles, prime: !!job.prime, plain: !!job.plain, range: job.range, since: job.since, catchUp: !!job.catchUp, url: job.url, retry: job.retry || 0 };
   scan.stepAt = Date.now();
   await setScan(scan);
+  // Multi-author catch-up can outlast the UI's stale-worker guard.
+  st.meta.checking = true;
+  st.meta.checkingAt = scan.stepAt;
+  await save(st, ['meta']);
 
   let tab;
   try {
@@ -302,13 +313,15 @@ function settleJob(st, scan, job, error) {
   const handle = String((job.handles || [])[0] || '').toLowerCase();
   const sub = st.subs.find((s) => s.handle.toLowerCase() === handle);
   if (!sub) return;
+  if (error) { scan.failedPrime = [...new Set([...(scan.failedPrime || []), handle])]; }
   if (!error) {
+    if (scan.queue.some(j=>j.prime && (j.handles || []).some(h=>h.toLowerCase()===handle)) || (scan.failedPrime || []).includes(handle)) return;
     sub.primed = true;
     delete sub.primeFails;
-    scan.primed.push(sub.handle);
+    if (!scan.primed.includes(sub.handle)) scan.primed.push(sub.handle);
     return;
   }
-  if (error === 'login') return;
+  if (error === 'login' || error === 'incomplete') return;
   // Next time, accounts that have not failed go first. After three tries the
   // account joins the regular searches without a first look.
   sub.primeFails = (sub.primeFails || 0) + 1;
@@ -323,7 +336,7 @@ async function finish(st, scan) {
   if (scan.full) {
     st.meta.lastAttempt = Date.now();
     // Failed/partial rounds must not move the successful catch-up boundary.
-    if (!scan.errors.length) st.meta.lastCheck = st.meta.lastAttempt;
+    if (!scan.errors.length) st.meta.lastCheck = scan.startedAt;
   }
   st.meta.lastError = scan.errors[0] || '';
   st.meta.lastAdded = scan.added || 0;
@@ -371,7 +384,7 @@ async function onScanDone(st, msg, sender) {
   // concluding that the account has no posts.
   const strict = job.prime && job.kind === 'search' && !job.plain && !st.settings.retweets && !st.settings.plainQuery;
   if (strict && (msg.error === 'nodata' || (!msg.error && !items.length))) {
-    scan.queue.unshift({ kind: 'search', prime: true, plain: true, handles: job.handles, url: searchUrl(job.handles, false, true) });
+    scan.queue.unshift({ kind: 'search', prime: true, plain: true, handles: job.handles, range:job.range, since:job.since, url: searchUrl(job.handles, false, true, job.range) });
     scan.pages++;
     await chrome.tabs.remove(tabId).catch(() => {});
     await nextStep(st, scan);
@@ -522,8 +535,11 @@ async function applySettings(st, patch) {
     }
   }
   next.intervalMin = Math.min(720, Math.max(5, Number(next.intervalMin) || 30));
+  next.windowHours = X.windowHours(next);
+  if (next.windowHours > X.windowHours(st.settings)) st.meta.lastCheck = 0;
   st.settings = next;
-  await save(st, ['settings']);
+  await save(st, ['settings', 'meta']);
+  await refreshBadge(st);
   await ensureAlarms(st);
   if (newList) primeSoon();
   return { ok: true, settings: next };
@@ -638,7 +654,7 @@ const handlers = {
       const st = await load();
       // A first look takes the first page as it is; a regular check reads on
       // until it reaches posts from before the last check.
-      return { scan: true, since: st.meta.lastCheck || Date.now(), deep: !(scan.cur && scan.cur.prime) };
+      return { scan: true, windowMs: X.windowMs(st.settings), since: Math.max(scan.cur && scan.cur.since || 0, scan.cur && scan.cur.prime ? 0 : st.meta.lastCheck || 0, Date.now() - X.windowMs(st.settings)), deep: true };
     });
   },
   async scanDone(msg, sender) {

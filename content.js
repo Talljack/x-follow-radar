@@ -69,9 +69,11 @@
     const hello = await send({ type: 'scanHello' });
     if (!hello || !hello.scan) return false;
 
-    const since = Math.max(hello.since || Date.now(), Date.now() - 48 * 3600 * 1000);
+    const since = Math.max(hello.since || 0, Date.now() - (hello.windowMs || 72 * 3600000));
     const items = new Map();
     let responses = 0;
+    let exhausted = false;
+    let incomplete = false;
 
     const absorb = () => {
       while (RAW.length) {
@@ -81,6 +83,15 @@
           const parsed = X.fromGraphQL(json);
           if (!parsed.length && !X.hasTimeline(json)) continue;
           responses++;
+          let entriesSeen = false, bottom = false;
+          const inspect = node => {
+            if (!node || typeof node !== 'object') return;
+            if (Array.isArray(node.entries)) entriesSeen = true;
+            if (node.cursorType === 'Bottom' && node.value) bottom = true;
+            for (const value of Object.values(node)) if (value && typeof value === 'object') inspect(value);
+          };
+          inspect(json);
+          if (!parsed.length || (entriesSeen && (!bottom || parsed.length < 20))) exhausted = true;
           for (const it of parsed) mergeItem(items, it);
         } catch {}
       }
@@ -96,7 +107,7 @@
       return fn();
     };
 
-    const deadline = Date.now() + 22000;
+    const deadline = Date.now() + 110000;
     await waitFor(() => responses > 0 || loginWall(), 15000);
 
     if (loginWall()) {
@@ -104,14 +115,30 @@
       return true;
     }
 
-    // Older posts only if the first page did not reach back far enough. A
-    // first look at an account takes the first page as it is.
-    for (let i = 0; hello.deep !== false && i < 3 && Date.now() < deadline; i++) {
-      const times = [...items.values()].map((t) => t.ts || 0).filter(Boolean);
-      if (!times.length || Math.min(...times) < since) break;
-      const seen = responses;
-      window.scrollTo(0, document.documentElement.scrollHeight);
-      if (!(await waitFor(() => responses > seen, 4000))) break;
+    // Keep paging until the previous successful round, or a confirmed end.
+    // A stalled/deadline-limited scan is partial, never a successful boundary.
+    if (hello.deep !== false) {
+      while (true) {
+        const times = [...items.values()].map(t => t.ts || 0).filter(Boolean);
+        if (exhausted || (times.length && Math.min(...times) <= since)) break;
+        if (!responses || Date.now() >= deadline) { incomplete = true; break; }
+        const seen = responses;
+        // The network response arrives before React has rendered its cards.
+        // Keep following the growing document instead of scrolling once too early.
+        if (!(await waitFor(() => {
+          if (responses > seen || loginWall()) return true;
+          window.scrollTo(0, Math.min((window.scrollY || 0) + (window.innerHeight || 10000) * 0.8, document.documentElement.scrollHeight));
+          return false;
+        }, 20000))) {
+          const atEnd = document.querySelector(TWEET) &&
+            !document.querySelector('[role="progressbar"]') &&
+            !/Something went wrong|Try again|出错了|重试/.test(document.body?.innerText || '') &&
+            (window.scrollY || 0) + (window.innerHeight || 0) >= document.documentElement.scrollHeight - 20;
+          incomplete = !atEnd;
+          break;
+        }
+        if (loginWall()) { incomplete = true; break; }
+      }
     }
 
     // Nothing came through the network: read the rendered cards instead.
@@ -121,7 +148,11 @@
     }
 
     const tweets = [...items.values()];
-    send({ type: 'scanDone', tweets, error: tweets.length || responses ? '' : 'nodata' });
+    if (hello.deep !== false && !responses && tweets.length) {
+      const times = tweets.map(t => t.ts || 0).filter(Boolean);
+      incomplete = !times.length || Math.min(...times) > since;
+    }
+    send({ type: 'scanDone', tweets, error: incomplete && (responses || tweets.length) ? 'incomplete' : tweets.length || responses ? '' : 'nodata' });
     return true;
   }
 
@@ -162,6 +193,18 @@
   .btn.icon { border:0; padding:4px 8px; font-size:16px; }
   .status { padding:8px 14px; color:var(--mut); font-size:12px; border-bottom:1px solid var(--line); }
   .status.err { color:#f4212e; }
+  .scope { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 14px 2px; }
+  .scope-time { display:flex; align-items:center; gap:10px; min-width:0; }
+  .scope-caption, .scope-note { color:var(--mut); font-size:12px; white-space:nowrap; }
+  .scope-options { display:flex; gap:2px; padding:3px; border-radius:10px; background:var(--chip); }
+  .scope-options button { border:0; border-radius:7px; background:transparent; color:var(--mut); min-width:48px; padding:6px 9px; font:500 12px/1.4 system-ui,-apple-system,"PingFang SC",sans-serif; cursor:pointer; transition:background .15s,color .15s; }
+  .scope-options button:hover { color:var(--fg); }
+  .scope-options button[aria-pressed="true"] { color:var(--fg); background:var(--bg); box-shadow:0 1px 4px #0002; font-weight:600; }
+  .scope-options button:active { transform:scale(.97); }
+  .scope-options button:focus-visible { outline:2px solid #1d9bf0; outline-offset:2px; }
+  .scope-note { display:flex; align-items:center; gap:4px; font-size:11px; }
+  .scope-note svg { flex:none; opacity:.8; }
+  @media (prefers-reduced-motion:reduce) { .scope-options button { transition:none; } .scope-options button:active { transform:none; } }
   .tabs { display:flex; gap:6px; padding:10px 14px 0; }
   .tabs .btn.on { background:var(--chip); border-color:transparent; }
   .body { flex:1; overflow:auto; padding:10px 12px 16px; }
@@ -264,10 +307,11 @@
     timeout: '后台页面加载超时',
     closed: '后台页面被关闭',
     nodata: '暂时未能读取 X 数据，请重试',
+    incomplete: '补查尚未完成，已保留取回的帖子，下次打开重新补查',
   };
 
   const byTsDesc = (a, b) => (b.ts || 0) - (a.ts || 0);
-  const allTweets = () => Object.values(S.tweets).sort(byTsDesc);
+  const allTweets = () => Object.values(S.tweets).filter(t => t.ts >= Date.now() - X.windowMs(S.settings)).sort(byTsDesc);
   const isRead = (t) => t.state === 'read' || pending.has(t.id);
   const unread = () => allTweets().filter((t) => !isRead(t));
 
@@ -276,6 +320,22 @@
   const body = h('div', { class: 'body' });
   const tabs = h('div', { class: 'tabs' });
   const status = h('div', { class: 'status' });
+  const scopeButtons = [[24,'24 小时'],[48,'2 天'],[72,'3 天']].map(([hours,text]) =>
+    h('button', {
+      type:'button', text, 'data-window-hours':String(hours), 'aria-pressed':'false',
+      'aria-label':`最近 ${text}`,
+      onclick:async()=>{
+        const result=await send({type:'setSettings',patch:{windowHours:hours}});
+        if(result?.ok){ S.settings=result.settings; kept.clear(); render(); requestCheck(true,true); }
+      },
+    }));
+  const scope = h('div',{class:'scope'},
+    h('div',{class:'scope-time'},h('span',{class:'scope-caption',text:'最近'}),
+      h('div',{class:'scope-options',role:'group','aria-label':'显示时间'},...scopeButtons)),
+    h('span',{class:'scope-note',title:'已读帖子下次不再显示。切换时间会自动检查。'},
+      h('svg',{width:'12',height:'12',viewBox:'0 0 16 16',fill:'none','aria-hidden':'true'},
+        h('path',{d:'m3 8 3 3 7-7',stroke:'currentColor','stroke-width':'1.6','stroke-linecap':'round','stroke-linejoin':'round'})),
+      h('span',{text:'已读隐藏'})));
   const title = h('b', { text: '关注雷达' });
   const fab = h(
     'button',
@@ -301,6 +361,7 @@
       h('button', { class: 'btn icon', text: '✕', onclick: () => setOpen(false) })
     ),
     status,
+    scope,
     tabs,
     body
   );
@@ -430,7 +491,7 @@
     const waiting = S.subs.some((s) => !s.primed);
     const empty = S.subs.length || S.settings.listUrl ? (waiting ? 'wait' : 'done') : 'none';
     return {
-      sig: `unread|${heads.map((t) => t.id).join(',')}|${empty}`,
+      sig: `unread|${X.windowHours(S.settings)}|${heads.map((t) => t.id).join(',')}|${empty}`,
       build() {
         if (!heads.length) return [emptyUnread(empty)];
         // Newest first, whoever posted it.
@@ -438,7 +499,6 @@
           h(
             'div',
             { class: 'bar' },
-            h('span', { class: 'mut', text: '看过的推文，下次不再显示' }),
             h('span', { class: 'grow' }),
             h('button', {
               class: 'btn',
@@ -587,6 +647,7 @@
 
   let drawn = '';
   function render() {
+    for (const button of scopeButtons) button.setAttribute('aria-pressed', String(Number(button.dataset.windowHours) === X.windowHours(S.settings)));
     if (!open) return;
     renderTabs();
     renderStatus();

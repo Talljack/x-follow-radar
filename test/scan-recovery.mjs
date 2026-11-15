@@ -16,7 +16,7 @@ function background() {
   const chrome = {
     storage: { local: area(local), session: area(session) },
     action: { async setBadgeText() {}, async setBadgeBackgroundColor() {}, onClicked: event() },
-    alarms: { create() {}, async clear() {}, onAlarm: event() },
+    alarms: { async get() {return null;}, create() {}, async clear() {}, onAlarm: event() },
     tabs: { async create(opts) { const tab = { ...opts, id: opened.length + 1, windowId: 1 }; opened.push(tab); return tab; }, async remove(id) { removed.push(id); }, onRemoved: event() },
     runtime: { onMessage: event() }, contextMenus: { onClicked: event() },
   };
@@ -112,7 +112,8 @@ test('opening checks every author individually, including more than ten new auth
   await b.run('(async()=>startCheck(await load(), {force:true, catchUp:true}))()');
   const scan = b.session.xfr_scan;
   const jobs = [scan.cur, ...scan.queue];
-  assert.equal(jobs.length, 23);
+  assert.equal(new Set(jobs.map(j=>j.handles[0])).size,23);
+  assert.ok(jobs.every(j=>j.range && j.url.includes("since%3A")));
   assert.ok(jobs.every(j => j.handles.length === 1 && j.catchUp));
 });
 test('opening during a scheduled check upgrades the remaining work to catch-up', async () => {
@@ -120,7 +121,8 @@ test('opening during a scheduled check upgrades the remaining work to catch-up',
   b.local.xfr_subs.push({ handle: 'second', primed: true, addedAt: 1 });
   await b.run('(async()=>startCheck(await load(), {force:true, catchUp:true}))()');
   assert.equal(b.session.xfr_scan.cur.catchUp, true);
-  assert.deepEqual(b.session.xfr_scan.queue.map(j => j.handles[0]), ['second']);
+  assert.ok(b.session.xfr_scan.queue.some(j=>j.handles[0]==='second'));
+  assert.ok(b.session.xfr_scan.queue.every(j=>j.range));
 });
 test('a confirmed empty timeline finishes without waiting for nonexistent next pages', async () => {
   let clock = 1000, scrolls = 0, result;
@@ -140,6 +142,47 @@ test('a subscription added during a check is queued without waiting for the next
   b.local.xfr_subs.push({handle:'added',primed:false,addedAt:1});
   await b.run('(async()=>startCheck(await load(), {force:true, primeOnly:true}))()');
   assert.ok(b.session.xfr_scan.queue.some(j=>j.handles[0]==='added'));
+});
+
+test('partial pagination keeps posts without moving the previous successful boundary', async () => {
+  const b = background(); await b.seed();
+  await b.done('incomplete', [{id:'partial',handle:'OpenAI',ts:Date.now(),text:'partial post'}]);
+  assert.equal(b.local.xfr_meta.lastCheck,123);
+  assert.equal(b.local.xfr_meta.lastError,'incomplete');
+  assert.ok(b.local.xfr_tweets.partial);
+  assert.equal(b.local.xfr_tweets.cached.seen,true);
+});
+test('unread backlog is not silently discarded at the 600-post history limit', async () => {
+  const b = background(); await b.seed();
+  await b.done('',Array.from({length:650},(_,i)=>({id:'backlog'+i,handle:'OpenAI',ts:Date.now()+i})));
+  assert.equal(Object.values(b.local.xfr_tweets).filter(t=>t.state!=='read').length,650);
+});
+
+test('three-day window excludes older posts and recovers more than ten recent posts', async () => {
+ const b=background(); await b.seed();
+ await b.run("(async()=>{const s=await load();s.subs[0].addedAt=Date.now();await save(s,['subs']);const scan=await getScan();scan.cur.catchUp=true;await setScan(scan)})()");
+ await b.done('',Array.from({length:16},(_,i)=>({id:'window'+i,handle:'OpenAI',ts:Date.now()-(i===15?4*86400000:i*3600000)})));
+ assert.equal(Object.values(b.local.xfr_tweets).filter(t=>t.id.startsWith('window')&&t.state!=='read').length,15);
+ assert.equal(b.local.xfr_tweets.window15,undefined);
+});
+
+test('changing the time window is validated, saved and widens the catch-up boundary', async()=>{
+ const b=background();await b.seed();
+ await b.run('(async()=>applySettings(await load(),{windowHours:24}))()');
+ assert.equal(b.local.xfr_settings.windowHours,24);
+ await b.run('(async()=>applySettings(await load(),{windowHours:72}))()');
+ assert.equal(b.local.xfr_meta.lastCheck,0);
+ await b.run('(async()=>applySettings(await load(),{windowHours:999}))()');
+ assert.equal(b.local.xfr_settings.windowHours,72);
+});
+
+test('long catch-up refreshes the UI heartbeat at each page without advancing success',async()=>{
+ const b=background();await b.seed();
+ b.local.xfr_meta.checkingAt=Date.now()-5*60000;
+ await b.run('(async()=>{const st=await load(),scan=await getScan();scan.queue.push({...scan.cur});await nextStep(st,scan)})()');
+ assert.ok(Date.now()-b.local.xfr_meta.checkingAt<1000,'active page must refresh checkingAt');
+ assert.equal(b.local.xfr_meta.checking,true);
+ assert.equal(b.local.xfr_meta.lastCheck,123);
 });
 
 let failed = 0;

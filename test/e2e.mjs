@@ -273,7 +273,7 @@ try {
   const statusText = async () => (await page.locator('#xfr-host .status').innerText()).replace(/\s+/g, ' ');
   const closePanel = () => page.locator('#xfr-host .panel .head button', { hasText: '✕' }).click();
 
-  if (!process.argv.includes('--recovery')) {
+  if (!process.argv.includes('--recovery') && !process.argv.includes('--window')) {
   console.log('\n1. 从博主主页快速添加');
   await page.goto('https://x.com/alice');
   const add = page.locator('button[data-xfr="btn"]');
@@ -286,7 +286,7 @@ try {
   ok(await until(async () => (await add.innerText()).includes('已在雷达'), 5000), '按钮变成“已在雷达”');
   ok((await toastText(page)).includes('@alice'), '有添加成功的提示');
   ok(await settled(), '几秒内自动去取这位博主最近的推文');
-  ok(world.queries.includes('(from:alice) -filter:replies -filter:nativeretweets'), '新博主单独查一次', world.queries);
+  ok(world.queries.some(q=>q.startsWith('(from:alice) -filter:replies -filter:nativeretweets')), '新博主单独查一次', world.queries);
   await expire();
 
   console.log('\n2. 在面板里添加 / 无效输入');
@@ -323,7 +323,7 @@ try {
   ok(await until(async () => (await toastText(page)).includes('2 位博主有 2 条新推文'), 8000), '弹窗：2 位博主有 2 条新推文', await toastText(page));
   await page.screenshot({ path: shot('toast.png') }).catch(() => {});
   let st = await states();
-  ok(st['100'] === 'read', '已经看过首轮的博主，后来才抓到的旧推文不弹，只进历史', st);
+  ok(st['100'] === undefined, '超过三天的旧帖不入库', st);
   await until(async () => { const current = await states(); return current['101'] === 'shown' && current['201'] === 'shown'; }, 5000);
   st = await states();
   ok(st['101'] === 'shown' && st['201'] === 'shown', '新推文弹过后记为“已弹”', st);
@@ -343,7 +343,7 @@ try {
   ok(await enter(page), '再检查一次（同样的内容）');
   await sleep(1500);
   ok(!(await toast(page).isVisible()), '同样的推文不会再弹');
-  ok(Object.keys(await states()).length === 3, '记录没有重复', await states());
+  ok(Object.keys(await states()).length === 2, '记录没有重复', await states());
 
   world.feed.unshift({ id: '202', handle: 'bob', name: 'Bob', text: 'bob second', ts: T + 120000 });
   await expire();
@@ -430,13 +430,13 @@ try {
   let carol = await tweetsOf('carol');
   const shownTexts = carol.filter((t) => t.state === 'shown').map((t) => t.text);
   ok(
-    carol.length === 12 && shownTexts.length === 10 && !shownTexts.includes('carol old 11') && !shownTexts.includes('carol old 12'),
-    '最近 10 条进未读，更早的 2 条只进历史',
+    carol.length === 12 && shownTexts.length === 12,
+    '三天内全部 12 条进入未读',
     carol.map((t) => [t.text, t.state])
   );
   ok(!carol.some((t) => t.state === 'new') && !(await toastText(page)).includes('新推文'), '订阅之前发的不当成“新推文”弹窗');
-  ok(world.queries.includes('(from:carol) -filter:replies -filter:nativeretweets'), '新博主单独查一次，不会被别的博主挤掉', world.queries.slice(-3));
-  ok(await until(async () => (await statusText()).includes('取回 10 条'), 5000), '状态栏说明取回了 10 条', await statusText());
+  ok(world.queries.some(q=>q.startsWith('(from:carol) -filter:replies -filter:nativeretweets')), '新博主单独查一次，不会被别的博主挤掉', world.queries.slice(-3));
+  ok(await until(async () => (await statusText()).includes('取回 12 条'), 5000), '状态栏说明取回了 12 条', await statusText());
   await closePanel();
   // From a profile, with the panel closed: a note says the posts have arrived.
   await page.goto('https://x.com/dave');
@@ -454,7 +454,7 @@ try {
   const u0 = Object.values((await store()).xfr_tweets).filter((t) => t.state !== 'read').length;
   ok(n0 === u0 && n0 >= 13, `点“查看”打开面板，未读里直接列出 ${n0} 条推文`, { n0, u0 });
   ok(
-    (await page.locator('#xfr-host .panel .item', { hasText: 'carol old' }).count()) === 10 &&
+    (await page.locator('#xfr-host .panel .item', { hasText: 'carol old' }).count()) === 12 &&
       (await page.locator('#xfr-host .panel .item', { hasText: 'dave old' }).count()) === 3,
     '两位新博主最近的推文都在'
   );
@@ -498,10 +498,10 @@ try {
   await input.press('Enter');
   await until(async () => ((await store()).xfr_subs || []).some((x) => x.handle === 'carol'), 5000);
   ok(await settled(), '重新订阅后再看一次');
-  const latest = (await tweetsOf('carol')).sort((a, b) => b.ts - a.ts).slice(0, 10);
+  const latest = (await tweetsOf('carol')).sort((a, b) => b.ts - a.ts);
   ok(
-    seenCarol.size > 0 && seenCarol.size < 10 && latest.every((t) => (seenCarol.has(t.id) ? t.state === 'read' : t.state === 'shown')),
-    `看过的 ${seenCarol.size} 条不回来，没看过的 ${10 - seenCarol.size} 条回到未读`,
+    seenCarol.size > 0 && seenCarol.size < 12 && latest.every((t) => (seenCarol.has(t.id) ? t.state === 'read' : t.state === 'shown')),
+    `看过的 ${seenCarol.size} 条不回来，没看过的 ${12 - seenCarol.size} 条回到未读`,
     latest.map((t) => [t.text, t.state, !!t.seen])
   );
   await tabBtn('未读').click();
@@ -632,9 +632,9 @@ try {
     return {
       plain: q(searchUrl(['a', 'b'], false)),
       reposts: q(searchUrl(['a'], true)),
-      solos: full.filter((j) => j.prime).map((j) => j.handles[0]),
+      solos: [...new Set(full.filter((j) => j.prime).map((j) => j.handles[0]))],
       batches: full.filter((j) => !j.prime).map((j) => j.handles.length),
-      primeOnly: buildQueue(state, true).length,
+      primeOnly: new Set(buildQueue(state,true).map(j=>j.handles[0])).size,
     };
   });
   ok(unit.plain === '(from:a OR from:b) -filter:replies -filter:nativeretweets', '默认排除回复和转帖', unit.plain);
@@ -657,7 +657,7 @@ try {
   ok(await settled(), '首轮查看完成');
   const gina = await tweetsOf('gina');
   ok(gina.length === 2 && gina.every((t) => t.state === 'shown'), '带条件查不到时，自动改用不带条件的搜索再查一次', gina.map((t) => [t.text, t.state]));
-  ok(world.queries.includes('(from:gina) -filter:replies -filter:nativeretweets') && world.queries.includes('(from:gina) -filter:replies'), '先带条件、后不带条件各查一次', world.queries.slice(-3));
+  ok(world.queries.some(q=>q.startsWith('(from:gina) -filter:replies -filter:nativeretweets')) && world.queries.some(q=>q.startsWith('(from:gina) -filter:replies since:')), '先带条件、后不带条件各查一次', world.queries.slice(-3));
   s = await store();
   ok(s.xfr_settings.plainQuery === true && !s.xfr_tweets['9311'], '记住这一点；转帖仍然被过滤掉', s.xfr_settings);
   world.feed.unshift({ id: '205', handle: 'bob', name: 'Bob', text: 'bob after the fallback', ts: Date.now() + 5000 });
@@ -861,6 +861,7 @@ try {
     await page.goto('https://x.com/home');
     await page.locator('#xfr-host .fab').waitFor();
   }
+  if (!process.argv.includes('--window')) {
   console.log('\n28. X 临时加载失败：自动重试并保留同步边界');
   if (await page.locator('#xfr-host .panel').isVisible()) await closePanel();
   await idle();
@@ -878,7 +879,10 @@ try {
   let recoveryState = await store();
   ok(world.searches === beforeRecovery + 2, '首个 API 错误自动重开一次后台页');
   ok(['new', 'shown'].includes(recoveryState.xfr_tweets['999001']?.state) && !recoveryState.xfr_meta.lastError, '重试取回新帖，错误状态清除', {tweet:recoveryState.xfr_tweets['999001'],meta:recoveryState.xfr_meta});
+  const beforePanelCheck = world.searches;
   await page.locator('#xfr-host .fab').click();
+  // Opening schedules a check asynchronously; idle alone can return before it starts.
+  await until(() => world.searches > beforePanelCheck, 12000);
   await idle();
   await (await worker()).evaluate(() => handlers.markAllRead());
   recoveryState = await store();
@@ -889,7 +893,7 @@ try {
   await beginRecovery();
   ok(await idle(), '连续失败后的检查结束');
   recoveryState = await store();
-  ok(world.searches === beforeRecovery + 2, '连续失败最多尝试两次，不循环');
+  ok(world.searches === beforeRecovery + 2, '连续失败最多尝试两次，不循环', {before:beforeRecovery,after:world.searches,meta:recoveryState.xfr_meta});
   ok(recoveryState.xfr_meta.lastError === 'nodata' && recoveryState.xfr_meta.lastCheck === lastSuccess, '失败不伪装成功，不推进成功同步时间');
   ok(JSON.stringify(recoveryState.xfr_ledger) === ledgerBeforeFailure && !!recoveryState.xfr_tweets['999001'], '失败保留缓存与去重记录');
   await until(async () => (await page.locator('#xfr-host .status').innerText()).includes('更新失败，当前为缓存'), 5000);
@@ -922,7 +926,49 @@ try {
   await page.locator('#xfr-host .fab').click();
   await until(() => world.searches >= firstOpenSearches + 2);
   await idle();
-  ok(world.searches === firstOpenSearches + 2, '一分钟内关闭重开也逐个检查两位博主，不受30分钟间隔限制');
+  const reopenedQueries=world.queries.slice(firstOpenSearches);
+  ok(reopenedQueries.some(q=>q.includes('from:first')) && reopenedQueries.some(q=>q.includes('from:second')), '一分钟内关闭重开也逐个检查两位博主，不受30分钟间隔限制',reopenedQueries);
+  }
+  console.log('\n30. 补查时间范围：可选、立即生效、持久保存');
+  await idle();
+  const rangeNow=Date.now();
+  await (await worker()).evaluate(async now=>{
+    const d=await chrome.storage.local.get(null);
+    await chrome.storage.local.set({xfr_subs:[{handle:'windowtest',addedAt:1,primed:true}],
+      xfr_settings:{...d.xfr_settings,windowHours:72},
+      xfr_tweets:{rangeRecent:{id:'rangeRecent',handle:'windowtest',ts:now-12*3600000,text:'within twelve hours',state:'shown'},
+        rangeOlder:{id:'rangeOlder',handle:'windowtest',ts:now-36*3600000,text:'within thirty-six hours',state:'shown'}},
+      xfr_meta:{...d.xfr_meta,lastCheck:now,checking:false}});
+  },rangeNow);
+  const rangeSelect=page.locator('#xfr-host .scope-options');
+  const rangeButton=hours=>rangeSelect.locator(`button[data-window-hours="${hours}"]`);
+  const selectedRange=()=>rangeSelect.locator('button[aria-pressed="true"]').getAttribute('data-window-hours');
+  if (!(await page.locator('#xfr-host .panel').isVisible())) await page.locator('#xfr-host .fab').click();
+  await until(async()=>await selectedRange()==='72');
+  ok(await rangeSelect.isVisible(),'空列表或任意标签页都能看到补查范围');
+  await rangeButton(24).click();
+  ok(await until(async()=>(await store()).xfr_settings.windowHours===24),'24 小时范围保存成功');
+  await until(async()=>(await page.locator('#xfr-host .item[data-id="rangeOlder"]').count())===0 && (await page.locator('#xfr-host .item[data-id="rangeRecent"]').count())===1);
+  ok(await page.locator('#xfr-host .item[data-id="rangeRecent"]').count()===1 && await page.locator('#xfr-host .item[data-id="rangeOlder"]').count()===0,'缩小范围只显示 24 小时内帖子');
+  const searchesBeforeWiden=world.searches;
+  await rangeButton(72).click();
+  ok(await until(async()=>await page.locator('#xfr-host .item[data-id="rangeOlder"]').count()===1),'扩大范围恢复范围内未读');
+  ok(await until(()=>world.searches>searchesBeforeWiden),'切换后自动补查');
+  await page.reload();
+  await page.locator('#xfr-host .fab').waitFor();
+  await page.locator('#xfr-host .fab').click();
+  ok(await until(async()=>await selectedRange()==='72'),'刷新后保留用户选择');
+  for(const width of [1280,375]) {
+    await page.setViewportSize({width,height:900});
+    const layout=await page.locator('#xfr-host .scope').evaluate(el=>{
+      const a=el.querySelector('.scope-time').getBoundingClientRect(),b=el.querySelector('.scope-note').getBoundingClientRect(),r=el.getBoundingClientRect();
+      return {fits:a.right<=b.left && b.right<=r.right, height:r.height};
+    });
+    ok(layout.fits && layout.height<60,`${width}px 时间切换紧凑且无重叠`,layout);
+    await page.screenshot({path:shot(`time-window-${width}.png`)});
+  }
+  await page.screenshot({path:shot('time-window.png')});
+
 } catch (e) {
   failed++;
   console.log('  FAIL  ' + (e && e.stack ? e.stack : e));
