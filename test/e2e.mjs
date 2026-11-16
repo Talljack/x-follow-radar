@@ -30,7 +30,7 @@ const shot = (name) => path.join(EXT, 'test', 'shots', name);
 
 // ------------------------------------------------------------ fake x.com
 
-const world = { feed: [], home: [], domOnly: false, loggedOut: false, strictBroken: false, apiErrors: 0, searches: 0, queries: [] };
+const world = { feed: [], home: [], domOnly: false, loggedOut: false, strictBroken: false, apiErrors: 0, rateLimits: 0, searches: 0, queries: [] };
 
 const pad = (n) => String(n).padStart(2, '0');
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -98,6 +98,10 @@ async function serve(route) {
   const html = (body) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: shell(body) });
 
   if (url.pathname.includes('/graphql/')) {
+    if (world.rateLimits > 0) {
+      world.rateLimits--;
+      return route.fulfill({status:429,headers:{'retry-after':'120'},contentType:'text/plain',body:'Rate limit exceeded'});
+    }
     if (world.apiErrors > 0) {
       world.apiErrors--;
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ errors: [{ message: 'Temporary X error' }] }) });
@@ -505,12 +509,15 @@ try {
     latest.map((t) => [t.text, t.state, !!t.seen])
   );
   await tabBtn('未读').click();
+  // Storage completion precedes the panel's debounced sync. The action marks
+  // the displayed snapshot; first wait for the final restored card to appear.
+  ok(await until(async()=>await page.locator('#xfr-host [data-id="9112"]').count()===1), '重订阅的最后一条未读已显示');
   await page.locator('#xfr-host .bar button', { hasText: '全部已读' }).click();
   ok(
     await until(async () => (await page.locator('#xfr-host .panel .empty').count()) === 1 && (await page.locator('#xfr-host .panel .empty').innerText()).includes('都看完了'), 5000),
     '点“全部已读”：未读清空'
   );
-  ok(await until(async () => (await badge()) === '', 5000), '角标清零', await badge());
+  ok(await until(async () => (await badge()) === '', 5000), '角标清零', {badge:await badge(),unread:Object.values((await store()).xfr_tweets).filter(t=>t.state!=='read').map(t=>({id:t.id,text:t.text,seen:t.seen}))});
 
   console.log('\n13. 插件更新后：已打开的页面不用刷新，旧版本存下的推文回到未读');
   // What is on the page, and whether the copy from before the update put it there.
@@ -968,6 +975,59 @@ try {
     await page.screenshot({path:shot(`time-window-${width}.png`)});
   }
   await page.screenshot({path:shot('time-window.png')});
+
+  console.log('\n31. 全部已读仅处理当前范围，扩大范围仍能看到未读旧帖');
+  await idle();world.feed=[];
+  await (await worker()).evaluate(async()=>{
+    const d=await chrome.storage.local.get(null), now=Date.now();
+    await chrome.storage.local.set({xfr_settings:{...d.xfr_settings,windowHours:24},xfr_tweets:{
+      bulkRecent:{id:'bulkRecent',handle:'windowtest',ts:now-3600000,text:'visible post',state:'shown'},
+      bulkOlder:{id:'bulkOlder',handle:'windowtest',ts:now-36*3600000,text:'hidden older unread post',state:'shown'}}});
+  });
+  await page.setViewportSize({width:1280,height:900});
+  await until(async()=>await selectedRange()==='24');
+  await page.locator('#xfr-host button').filter({hasText:/^全部已读$/}).click();
+  await until(async()=>(await store()).xfr_tweets.bulkRecent.state==='read');
+  ok((await store()).xfr_tweets.bulkOlder.state==='shown','24小时全部已读不会误标36小时前的帖子');
+  await rangeButton(72).click();
+  ok(await until(async()=>await page.locator('#xfr-host [data-id="bulkOlder"]').count()===1),'扩大到三天后旧帖仍进入未读');
+
+  console.log('\n32. 手动已读后立刻刷新，记录仍然保存');
+  await page.locator('#xfr-host [data-id="bulkOlder"] button[title="标记为已读"]').click();
+  await page.reload();
+  await page.locator('#xfr-host .fab').waitFor();
+  await page.locator('#xfr-host .fab').click();
+  ok(await until(async()=>(await store()).xfr_tweets.bulkOlder.state==='read'),'点击后立即刷新仍保存已读');
+  ok(await page.locator('#xfr-host [data-id="bulkOlder"]').count()===0,'刷新后未读不再出现该帖');
+
+  console.log('\n33. 首页刚达到阅读时间就刷新，不丢已读');
+  await idle();
+  world.home=[{id:'999000000000000033',handle:'windowtest',text:'read then immediately navigate',ts:Date.now()}];
+  await page.goto('https://x.com/home');
+  await page.locator('#xfr-host .fab').waitFor();
+  await sleep(1200);
+  await page.reload();
+  ok(await until(async()=>(await store()).xfr_ledger.includes('999000000000000033')),'无需等待原来的三秒批处理即可持久化首页阅读');
+
+  console.log('\n34. 真实 HTTP 429 响应：停止请求、保留队列、冷却后续跑');
+  await idle();world.home=[];world.feed=[{id:'999000000000000034',handle:'cooldown',text:'after cooldown',ts:Date.now()}];world.rateLimits=1;
+  await (await worker()).evaluate(async()=>{const d=await chrome.storage.local.get('xfr_meta');await chrome.storage.local.set({xfr_subs:[{handle:'cooldown',primed:true,addedAt:1}],xfr_meta:{...d.xfr_meta,lastCheck:1,lastAttempt:1,lastError:'',retryAt:0}})});
+  await page.locator('#xfr-host .fab').click();
+  const beforeLimited=world.searches;
+  ok(await until(async()=>(await store()).xfr_meta.lastError==='rateLimit',10000),'HTTP 429 被单独识别为限流');
+  let paused=await (await worker()).evaluate(async()=>(await chrome.storage.session.get('xfr_scan')).xfr_scan);
+  ok(paused?.pausedUntil>Date.now()&&paused.queue.length>0&&!paused.tabId,'限流后保存剩余队列并停止请求');
+  const limitedCount=world.searches;
+  await page.locator('#xfr-host .head button').filter({hasText:/^检查$/}).click();
+  await sleep(1000);
+  ok(world.searches===limitedCount,'连续点检查不能绕过冷却');
+  ok((await page.locator('#xfr-host .status').innerText()).includes('限制请求'),'用户能看到限流与自动继续提示');
+  ok((await store()).xfr_meta.lastCheck===1,'限流期间不会伪造成功时间');
+  // Only this fake HTTPS fixture advances its cooldown clock; real X tests
+  // always respect the server's retry time.
+  await (await worker()).evaluate(async()=>{const d=await chrome.storage.local.get('xfr_meta'),s=(await chrome.storage.session.get('xfr_scan')).xfr_scan;s.pausedUntil=1;await chrome.storage.session.set({xfr_scan:s});await chrome.storage.local.set({xfr_meta:{...d.xfr_meta,retryAt:1}});chrome.alarms.create('xfr-retry',{when:Date.now()+100})});
+  ok(await idle(),'冷却到期自动完成保留的队列');
+  ok(!!(await store()).xfr_tweets['999000000000000034']&&(await store()).xfr_meta.lastError==='','续跑后取回帖子且清除限流状态');
 
 } catch (e) {
   failed++;

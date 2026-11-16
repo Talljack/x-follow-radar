@@ -18,6 +18,10 @@
       if (TIMELINE.test(u)) {
         this.addEventListener('load', () => {
           try {
+            if (this.status === 429) {
+              window.postMessage({ __xfr: 'http', status: 429, after: this.getResponseHeader('retry-after'), reset: this.getResponseHeader('x-rate-limit-reset') }, location.origin);
+              return;
+            }
             if (this.status !== 200) return; // an error page (rate limit, say) is not an empty timeline
             const type = this.responseType;
             if (type === '' || type === 'text') post(u, this.responseText);
@@ -35,7 +39,11 @@
     try {
       const u = typeof input === 'string' ? input : (input && input.url) || '';
       if (TIMELINE.test(u)) {
-        p.then((res) => (res.ok ? res.clone().text().then((body) => post(u, body)) : null)).catch(() => {});
+        p.then((res) => {
+          if (res.status === 429) {
+            window.postMessage({ __xfr: 'http', status: 429, after: res.headers.get('retry-after'), reset: res.headers.get('x-rate-limit-reset') }, location.origin);
+          } else if (res.ok) return res.clone().text().then((body) => post(u, body));
+        }).catch(() => {});
       }
     } catch {}
     return p;

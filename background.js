@@ -85,8 +85,8 @@ const newestFirst = (a, b) => (b.ts || 0) - (a.ts || 0);
 function prune(st) {
   const all = Object.values(st.tweets);
   if (all.length > MAX_TWEETS) {
-    const unread = all.filter((t) => t.state !== 'read').sort(newestFirst);
-    const read = all.filter((t) => t.state === 'read').sort(newestFirst);
+    const unread = all.filter((t) => t.state !== 'read' || !t.seen).sort(newestFirst);
+    const read = all.filter((t) => t.state === 'read' && t.seen).sort(newestFirst);
     st.tweets = Object.fromEntries(unread.concat(read.slice(0, Math.max(0, MAX_TWEETS - unread.length))).map((t) => [t.id, t]));
   }
   if (st.ledger.length > MAX_LEDGER) st.ledger = st.ledger.slice(-MAX_LEDGER);
@@ -109,7 +109,8 @@ function ingest(st, items, job) {
   if (job.prime || job.catchUp) {
     const owner = list ? '' : String((job.handles || [])[0] || '').toLowerCase();
     items
-      .filter((it) => it && it.id && it.handle && !(it.via || []).length && (list || job.catchUp || it.handle.toLowerCase() === owner))
+      .filter((it) => it && it.id && it.handle && (!(it.via || []).length || st.settings.retweets) &&
+        (list || job.catchUp || [it.handle, ...(it.via || [])].some(h => h.toLowerCase() === owner)))
       .sort(newestFirst)
       .forEach((it) => {
         if (it.ts >= Date.now() - X.windowMs(st.settings)) recent.add(it.id);
@@ -223,18 +224,45 @@ function buildQueue(st, primeOnly, catchUp = false) {
   });
 }
 
+const scanSettings = st => JSON.stringify([X.windowHours(st.settings), !!st.settings.retweets, !!st.settings.plainQuery, st.settings.listUrl || '']);
+
 async function startCheck(st, opts) {
   const o = opts || {};
+  if ((st.meta.retryAt || 0) > Date.now()) return { started: false, reason: 'rateLimit', retryAt: st.meta.retryAt };
   const queue = buildQueue(st, !!o.primeOnly, !!o.catchUp);
   if (o.catchUp) for (const job of queue) job.catchUp = true;
-  if (!queue.length) return { started: false, reason: 'empty' };
+  if (!queue.length) {
+    const pending = await getScan();
+    if (pending?.pausedUntil) {
+      await setScan(null);
+      st.meta.retryAt = 0;
+      await save(st, ['meta']);
+      chrome.alarms.clear('xfr-watchdog');
+      chrome.alarms.clear('xfr-retry');
+    }
+    return { started: false, reason: 'empty' };
+  }
 
   const running = await getScan();
+  if (running && running.pausedUntil) {
+    if (running.settingsKey !== scanSettings(st)) {
+      running.queue = buildQueue(st, false, true).map(j => ({ ...j, catchUp: true }));
+      running.full = true;
+    }
+    const handles = new Set(st.subs.map(s => s.handle.toLowerCase()));
+    running.queue = running.queue.filter(j => j.kind === 'list' ? !!st.settings.listUrl : (j.handles || []).some(h => handles.has(h.toLowerCase())));
+    running.pausedUntil = 0;
+    st.meta.retryAt = 0;
+    chrome.alarms.clear('xfr-retry');
+    await save(st, ['meta']);
+    await nextStep(st, running);
+    return { started: true, resumed: true, pages: running.queue.length + 1 };
+  }
   if (running && Date.now() - running.stepAt < STEP_LIMIT + 35000) {
     // Opening while a scheduled check runs must still catch up every author.
     if (o.catchUp) {
       if (running.cur) running.cur.catchUp = true;
-      running.queue = queue.filter((job) => job.url !== (running.cur && running.cur.url));
+      running.queue = queue.filter((job) => job.url !== running.cur?.url || (job.since || 0) < (running.cur?.since || 0));
       await setScan(running);
     } else if (o.primeOnly) {
       const pending = new Set([running.cur && running.cur.url, ...running.queue.map(job => job.url)]);
@@ -272,6 +300,8 @@ async function startCheck(st, opts) {
   };
   const pages = queue.length;
   st.meta.checking = true;
+  st.meta.retryAt = 0;
+  chrome.alarms.clear('xfr-retry');
   st.meta.checkingAt = Date.now();
   await save(st, ['meta']);
   await setScan(scan);
@@ -283,7 +313,7 @@ async function startCheck(st, opts) {
 async function nextStep(st, scan) {
   const job = scan.queue.shift();
   if (!job) return finish(st, scan);
-  scan.cur = { kind: job.kind, handles: job.handles, prime: !!job.prime, plain: !!job.plain, range: job.range, since: job.since, catchUp: !!job.catchUp, url: job.url, retry: job.retry || 0 };
+  scan.cur = { kind: job.kind, handles: job.handles, prime: !!job.prime, plain: !!job.plain, range: job.range, since: job.since, catchUp: !!job.catchUp, url: job.url, retry: job.retry || 0, maxId: job.maxId, continuations: job.continuations || 0 };
   scan.stepAt = Date.now();
   await setScan(scan);
   // Multi-author catch-up can outlast the UI's stale-worker guard.
@@ -322,10 +352,9 @@ function settleJob(st, scan, job, error) {
     return;
   }
   if (error === 'login' || error === 'incomplete') return;
-  // Next time, accounts that have not failed go first. After three tries the
-  // account joins the regular searches without a first look.
+  // Failed first looks remain pending and are deprioritized on the next round.
   sub.primeFails = (sub.primeFails || 0) + 1;
-  if (sub.primeFails >= 3) sub.primed = true;
+  // Failure is not coverage: keep the first-look boundary until success.
   // Whatever went wrong is likely to go wrong for the next account as well.
   scan.queue = scan.queue.filter((j) => !(j.prime && j.kind === 'search'));
   scan.primeFailed = true;
@@ -339,6 +368,7 @@ async function finish(st, scan) {
     if (!scan.errors.length) st.meta.lastCheck = scan.startedAt;
   }
   st.meta.lastError = scan.errors[0] || '';
+  st.meta.lastFailures = scan.failures || [];
   st.meta.lastAdded = scan.added || 0;
   st.meta.lastFresh = scan.fresh || 0;
   st.meta.lastUnread = scan.unread || 0;
@@ -369,6 +399,26 @@ async function retryStep(st, scan, error) {
   return true;
 }
 
+// X can stop rendering its next-page trigger while still returning a cursor.
+// Continue through a fresh native search below the oldest actual timeline ID.
+// A non-progressing/ignored bound stays incomplete; it is never end-of-feed.
+function olderSearch(job, items) {
+  if (job.kind !== 'search' || !job.url || (job.continuations || 0) >= 30) return null;
+  const handles = new Set((job.handles || []).map(h => h.toLowerCase()));
+  const own = items.filter(t => t && [t.handle, ...(t.via || [])].some(h => handles.has(String(h).toLowerCase())));
+  if (!own.length || own.some(t => (t.via || []).length && !t.scanId)) return null;
+  const ids = own.map(t => String(t.scanId || t.id));
+  if (ids.some(id => !/^\d+$/.test(id))) return null;
+  const values = ids.map(id => BigInt(id));
+  if (job.maxId && values.some(id => id > BigInt(job.maxId))) return null;
+  const maxId = values.reduce((a,b) => a < b ? a : b) - 1n;
+  if (maxId < 0n || (job.maxId && maxId >= BigInt(job.maxId))) return null;
+  const url = new URL(job.url);
+  const query = (url.searchParams.get('q') || '').replace(/\s+max_id:\d+/g, '');
+  url.searchParams.set('q', `${query} max_id:${maxId}`);
+  return { ...job, url: url.href, maxId: String(maxId), retry: 0, continuations: (job.continuations || 0) + 1 };
+}
+
 async function onScanDone(st, msg, sender) {
   const scan = await getScan();
   const tabId = sender.tab && sender.tab.id;
@@ -378,11 +428,16 @@ async function onScanDone(st, msg, sender) {
   scan.tabId = null;
   const job = scan.cur || { kind: 'search', handles: [] };
   const items = Array.isArray(msg.tweets) ? msg.tweets : [];
+  // A changed/ignored X search operator must not turn a repeat page into
+  // successful coverage, even if that page claims to be exhausted.
+  if (job.maxId && items.some(t => /^\d+$/.test(String(t.scanId || t.id)) && BigInt(t.scanId || t.id) > BigInt(job.maxId))) {
+    msg = { ...msg, error: 'incomplete' };
+  }
 
   // An account's first look came back with nothing at all. X may not take the
   // "no reposts" condition (any more), so look once more without it before
   // concluding that the account has no posts.
-  const strict = job.prime && job.kind === 'search' && !job.plain && !st.settings.retweets && !st.settings.plainQuery;
+  const strict = job.prime && !job.maxId && job.kind === 'search' && !job.plain && !st.settings.retweets && !st.settings.plainQuery;
   if (strict && (msg.error === 'nodata' || (!msg.error && !items.length))) {
     scan.queue.unshift({ kind: 'search', prime: true, plain: true, handles: job.handles, range:job.range, since:job.since, url: searchUrl(job.handles, false, true, job.range) });
     scan.pages++;
@@ -403,8 +458,30 @@ async function onScanDone(st, msg, sender) {
   scan.unread += res.unread;
   scan.pages++;
   if (job.prime && job.kind === 'search') scan.primedUnread += res.unread;
-  if (msg.error) scan.errors.push(msg.error);
-  settleJob(st, scan, job, msg.error || '');
+  if (msg.error === 'rateLimit') {
+    // Keep completed work and resume this page (or its older-ID continuation)
+    // after X allows requests again. Opening the panel cannot bypass this.
+    scan.queue.unshift(olderSearch(job, items) || { ...job, retry: 0 });
+    scan.cur = null;
+    scan.pausedUntil = Math.max(Date.now() + 60000, Number(msg.retryAt) || Date.now() + 300000);
+    scan.settingsKey = scanSettings(st);
+    st.meta.checking = false;
+    st.meta.lastError = 'rateLimit';
+    st.meta.retryAt = scan.pausedUntil;
+    await save(st, ['tweets', 'ledger', 'subs', 'settings', 'meta']);
+    await setScan(scan);
+    chrome.alarms.create('xfr-retry', { when: scan.pausedUntil });
+    await refreshBadge(st);
+    await chrome.tabs.remove(tabId).catch(() => {});
+    return { ok: true, paused: true, retryAt: scan.pausedUntil };
+  }
+  const continuation = msg.error === 'incomplete' ? olderSearch(job, items) : null;
+  if (continuation) scan.queue.unshift(continuation);
+  if (msg.error && !continuation) {
+    scan.errors.push(msg.error);
+    (scan.failures ||= []).push({ handles: job.handles, range: job.range, error: msg.error, diagnostics: msg.diagnostics });
+  }
+  settleJob(st, scan, job, continuation ? '' : msg.error || '');
 
   await save(st, ['tweets', 'ledger', 'subs', 'settings']);
   await refreshBadge(st);
@@ -425,6 +502,7 @@ async function abandon(st, scan, error) {
   const tabId = scan.tabId;
   scan.tabId = null;
   scan.errors.push(error);
+  (scan.failures ||= []).push({ handles: scan.cur?.handles, range: scan.cur?.range, error });
   settleJob(st, scan, scan.cur, error);
   await save(st, ['subs', 'settings']);
   if (tabId) await chrome.tabs.remove(tabId).catch(() => {});
@@ -437,6 +515,10 @@ async function watchdog() {
     chrome.alarms.clear('xfr-watchdog');
     return;
   }
+  if (scan.pausedUntil) {
+    if (Date.now() >= scan.pausedUntil) await startCheck(await load(), { force: true });
+    return;
+  }
   if (Date.now() - scan.stepAt < STEP_LIMIT) return;
   await abandon(await load(), scan, 'timeout');
 }
@@ -445,6 +527,9 @@ async function watchdog() {
 
 async function ensureAlarms(st) {
   const s = st || (await load());
+  if (s.meta.lastError === 'rateLimit' && s.meta.retryAt) {
+    chrome.alarms.create('xfr-retry', { when: Math.max(Date.now() + 1000, s.meta.retryAt) });
+  }
   const period = Math.max(1, Number(s.settings.intervalMin) || 30);
   // Leave a running timer alone. This runs every time the worker wakes up, and
   // recreating the timer would start the wait over each time.
@@ -512,8 +597,12 @@ async function addSub(st, handle, extra, windowId) {
 async function removeSub(st, handle) {
   const h = X.validHandle(handle).toLowerCase();
   st.subs = st.subs.filter((s) => s.handle.toLowerCase() !== h);
+  const remaining = new Set(st.subs.map(s => s.handle.toLowerCase()));
   for (const t of Object.values(st.tweets)) {
-    if (t.state !== 'read' && (t.handle.toLowerCase() === h || (t.via || []).some((v) => v.toLowerCase() === h))) {
+    const covered = remaining.has(t.handle.toLowerCase()) ||
+      (st.settings.retweets && (t.via || []).some(v => remaining.has(v.toLowerCase()))) ||
+      (st.settings.listUrl && t.src === 'list');
+    if (!covered && t.state !== 'read' && (t.handle.toLowerCase() === h || (t.via || []).some((v) => v.toLowerCase() === h))) {
       t.state = 'read';
     }
   }
@@ -591,8 +680,18 @@ const handlers = {
   async removeSub(msg) {
     return locked(async () => removeSub(await load(), msg.handle));
   },
-  async setSettings(msg) {
-    return locked(async () => applySettings(await load(), msg.patch));
+  async setSettings(msg, sender = {}) {
+    return locked(async () => {
+      const st = await load();
+      const previousHours = X.windowHours(st.settings);
+      const result = await applySettings(st, msg.patch);
+      // Keep the boundary reset and requeue in one transaction: scanDone
+      // must not finish the old range between these two operations.
+      if (X.windowHours(st.settings) !== previousHours) {
+        await startCheck(st, { force: true, catchUp: true, windowId: sender.tab?.windowId || null });
+      }
+      return result;
+    });
   },
   async check(msg, sender) {
     return locked(async () => {
@@ -618,10 +717,13 @@ const handlers = {
       return { ok: true, n };
     });
   },
-  async markAllRead() {
+  async markAllRead(msg = {}) {
     return locked(async () => {
       const st = await load();
-      const n = setState(st, Object.keys(st.tweets), 'read');
+      const cutoff = Date.now() - X.windowMs(st.settings);
+      const ids = (Array.isArray(msg.ids) ? msg.ids : Object.keys(st.tweets))
+        .filter(id => st.tweets[id] && st.tweets[id].ts >= cutoff);
+      const n = setState(st, ids, 'read');
       await save(st, ['tweets']);
       await refreshBadge(st);
       return { ok: true, n };
@@ -673,6 +775,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 });
 
 chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === 'xfr-retry') return locked(async () => startCheck(await load(), { force: true, catchUp: !(await getScan()) }));
   if (a.name === 'xfr-watchdog') return locked(() => watchdog());
   if (a.name === 'xfr-tick') return locked(() => tick());
   if (a.name === 'xfr-soon') {

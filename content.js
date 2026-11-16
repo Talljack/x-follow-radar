@@ -47,9 +47,13 @@
   // ========================================================================
 
   const RAW = [];
+  let HTTP_ERROR = null;
   window.addEventListener('message', (e) => {
     const d = e.data;
     if (e.source === window && d && d.__xfr === 'gql' && typeof d.body === 'string') RAW.push(d.body);
+    if (e.source === window && d && d.__xfr === 'http' && d.status === 429) {
+      HTTP_ERROR = { error: 'rateLimit', retryAt: X.retryAt(d.after, d.reset) };
+    }
   });
 
   function mergeItem(map, it) {
@@ -73,6 +77,7 @@
     const items = new Map();
     let responses = 0;
     let exhausted = false;
+    const emptyResult = () => /No results|没有.*结果|未找到|找不到|没有关于/i.test(document.querySelector('[data-testid="emptyState"]')?.textContent || '');
     let incomplete = false;
 
     const absorb = () => {
@@ -83,15 +88,18 @@
           const parsed = X.fromGraphQL(json);
           if (!parsed.length && !X.hasTimeline(json)) continue;
           responses++;
-          let entriesSeen = false, bottom = false;
+          let entriesSeen = false, bottom = false, terminated = false;
           const inspect = node => {
             if (!node || typeof node !== 'object') return;
             if (Array.isArray(node.entries)) entriesSeen = true;
             if (node.cursorType === 'Bottom' && node.value) bottom = true;
+            if (node.type === 'TimelineTerminateTimeline' && node.direction === 'Bottom') terminated = true;
             for (const value of Object.values(node)) if (value && typeof value === 'object') inspect(value);
           };
           inspect(json);
-          if (!parsed.length || (entriesSeen && (!bottom || parsed.length < 20))) exhausted = true;
+          // Filtering, unavailable posts and sparse pages can leave fewer than 20
+          // parsed tweets even when X supplies a continuation cursor.
+          if (terminated || (!bottom && (entriesSeen || !parsed.length))) exhausted = true;
           for (const it of parsed) mergeItem(items, it);
         } catch {}
       }
@@ -100,7 +108,7 @@
       const t0 = Date.now();
       while (Date.now() - t0 < ms) {
         absorb();
-        if (fn()) return true;
+        if (HTTP_ERROR || fn()) return true;
         await sleep(250);
       }
       absorb();
@@ -108,7 +116,7 @@
     };
 
     const deadline = Date.now() + 110000;
-    await waitFor(() => responses > 0 || loginWall(), 15000);
+    await waitFor(() => responses > 0 || emptyResult() || loginWall(), 15000);
 
     if (loginWall()) {
       send({ type: 'scanDone', tweets: [], error: 'login' });
@@ -119,8 +127,9 @@
     // A stalled/deadline-limited scan is partial, never a successful boundary.
     if (hello.deep !== false) {
       while (true) {
+        if (HTTP_ERROR) break;
         const times = [...items.values()].map(t => t.ts || 0).filter(Boolean);
-        if (exhausted || (times.length && Math.min(...times) <= since)) break;
+        if (exhausted || (!items.size && emptyResult()) || (times.length && Math.min(...times) <= since)) break;
         if (!responses || Date.now() >= deadline) { incomplete = true; break; }
         const seen = responses;
         // The network response arrives before React has rendered its cards.
@@ -130,11 +139,7 @@
           window.scrollTo(0, Math.min((window.scrollY || 0) + (window.innerHeight || 10000) * 0.8, document.documentElement.scrollHeight));
           return false;
         }, 20000))) {
-          const atEnd = document.querySelector(TWEET) &&
-            !document.querySelector('[role="progressbar"]') &&
-            !/Something went wrong|Try again|出错了|重试/.test(document.body?.innerText || '') &&
-            (window.scrollY || 0) + (window.innerHeight || 0) >= document.documentElement.scrollHeight - 20;
-          incomplete = !atEnd;
+          incomplete = !(!items.size && emptyResult());
           break;
         }
         if (loginWall()) { incomplete = true; break; }
@@ -142,8 +147,8 @@
     }
 
     // Nothing came through the network: read the rendered cards instead.
-    if (!items.size && !responses) {
-      await waitFor(() => document.querySelector(TWEET), 4000);
+    if (!HTTP_ERROR && !items.size && !responses) {
+      await waitFor(() => document.querySelector(TWEET) || emptyResult(), 4000);
       for (const article of document.querySelectorAll(TWEET)) mergeItem(items, X.fromArticle(article));
     }
 
@@ -152,7 +157,7 @@
       const times = tweets.map(t => t.ts || 0).filter(Boolean);
       incomplete = !times.length || Math.min(...times) > since;
     }
-    send({ type: 'scanDone', tweets, error: incomplete && (responses || tweets.length) ? 'incomplete' : tweets.length || responses ? '' : 'nodata' });
+    send({ type: 'scanDone', tweets, diagnostics: { responses, oldest: Math.min(...tweets.map(t => t.ts).filter(Boolean)), since, exhausted, empty: emptyResult() }, error: incomplete && (responses || tweets.length) ? 'incomplete' : tweets.length || responses || emptyResult() ? '' : 'nodata', ...(HTTP_ERROR || {}) });
     return true;
   }
 
@@ -308,6 +313,7 @@
     closed: '后台页面被关闭',
     nodata: '暂时未能读取 X 数据，请重试',
     incomplete: '补查尚未完成，已保留取回的帖子，下次打开重新补查',
+    rateLimit: '冷却后自动继续，不会丢失补查进度',
   };
 
   const byTsDesc = (a, b) => (b.ts || 0) - (a.ts || 0);
@@ -326,7 +332,7 @@
       'aria-label':`最近 ${text}`,
       onclick:async()=>{
         const result=await send({type:'setSettings',patch:{windowHours:hours}});
-        if(result?.ok){ S.settings=result.settings; kept.clear(); render(); requestCheck(true,true); }
+        if(result?.ok){ S.settings=result.settings; kept.clear(); await sync(); }
       },
     }));
   const scope = h('div',{class:'scope'},
@@ -404,6 +410,7 @@
     const backlog = (m.lastUnread || 0) - (m.lastFresh || 0);
     const err = !checking && m.lastError;
     if (checking) parts.push('正在检查…');
+    else if (err === 'rateLimit') parts.push(`X 暂时限制请求，约 ${Math.max(1, Math.ceil(((m.retryAt || Date.now()) - Date.now()) / 60000))} 分钟后继续`);
     else if (err) parts.push('更新失败，当前为缓存');
     else if (m.lastFresh) parts.push(`发现 ${m.lastFresh} 条新推文`);
     else if (backlog > 0) parts.push(`取回 ${backlog} 条最近的推文`);
@@ -505,8 +512,9 @@
               text: '全部已读',
               onclick: () => {
                 kept.clear();
-                for (const t of unread()) pending.add(t.id);
-                send({ type: 'markAllRead' });
+                const ids = unread().map(t => t.id);
+                for (const id of ids) pending.add(id);
+                send({ type: 'markAllRead', ids });
                 updateFab();
                 render();
               },
@@ -728,13 +736,13 @@
   const readQueue = new Set();
   let readTimer = 0;
 
-  function flushRead() {
+  async function flushRead() {
     clearTimeout(readTimer);
     readTimer = 0;
     if (!readQueue.size) return;
     const ids = [...readQueue];
-    readQueue.clear();
-    send({ type: 'markRead', ids });
+    const result = await send({ type: 'markRead', ids });
+    if (result?.ok) for (const id of ids) readQueue.delete(id);
   }
 
   // `keep`: leave the cards where they are for now (the user is reading).
@@ -745,7 +753,7 @@
       if (keep && open) kept.add(id);
     }
     clearTimeout(readTimer);
-    readTimer = setTimeout(flushRead, 800);
+    flushRead();
     updateFab();
     render();
   }
@@ -1120,13 +1128,13 @@
   let seenTimer = 0;
   function queueSeen(id) {
     seenQueue.add(id);
-    clearTimeout(seenTimer);
-    seenTimer = setTimeout(() => {
-      const ids = [...seenQueue];
-      seenQueue.clear();
-      if (ids.length) send({ type: 'seen', ids });
-    }, 3000);
+    // Persist the actual read decision now; navigation can discard timers.
+    const ids = [...seenQueue];
+    send({ type: 'seen', ids }).then(result => {
+      if (result?.ok) for (const id of ids) seenQueue.delete(id);
+    });
   }
+
   let scanQueued = false;
   function scanArticles() {
     scanQueued = false;
@@ -1271,6 +1279,7 @@
 
     const on = { signal: life.signal };
     window.addEventListener('resize', place, on);
+    window.addEventListener('pagehide', flushRead, on);
     document.addEventListener(
       'keydown',
       (e) => {

@@ -78,6 +78,7 @@
     const qu = q ? userOf(q) : null;
     return {
       id: r.rest_id,
+      scanId: r.rest_id,
       url: `https://x.com/${user.handle}/status/${r.rest_id}`,
       handle: user.handle,
       name: user.name || user.handle,
@@ -95,6 +96,7 @@
     const original = unwrap(r.legacy.retweeted_status_result && r.legacy.retweeted_status_result.result);
     if (!original) return plain(r);
     const item = plain(original);
+    item.scanId = r.rest_id;
     const reposter = userOf(r).handle;
     if (reposter) item.via = [reposter];
     item.ts = Date.parse(r.legacy.created_at) || item.ts;
@@ -208,5 +210,11 @@
 
   const windowHours = settings => [24,48,72].includes(Number(settings?.windowHours)) ? Number(settings.windowHours) : 72;
   const windowMs = settings => windowHours(settings) * 3600000;
-  globalThis.XFR = { windowHours, windowMs, TWEET, validHandle, handleFrom, fromGraphQL, hasTimeline, fromArticle, idOfArticle };
+  function retryAt(after, reset, now = Date.now()) {
+    const seconds = after == null || after === '' ? NaN : Number(after);
+    const dates = [Number(reset) * 1000, Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(after || '')];
+    const future = dates.filter(t => Number.isFinite(t) && t > now);
+    return future.length ? Math.max(now + 60000, ...future) : now + 300000;
+  }
+  globalThis.XFR = { windowHours, windowMs, retryAt, TWEET, validHandle, handleFrom, fromGraphQL, hasTimeline, fromArticle, idOfArticle };
 })();
